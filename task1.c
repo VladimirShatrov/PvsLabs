@@ -1,22 +1,18 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
-#include <omp.h>
+#include <mpi.h>
 
-#define MIN_SIZE 100000  // Минимальный размер массива
-#define MAX_SIZE 10000000 // Максимальный размер массива
-#define NUM_ITERATIONS 100 // Количество итераций для усреднения времени
+#define ITERATIONS 100
 
-// Функция для заполнения массива случайными числами
-void fill_array_random(int *arr, int size) {
-    srand(time(NULL));
+void fill_array_random(int* arr, int size, unsigned int seed) {
+    srand(seed);
     for (int i = 0; i < size; i++) {
-        arr[i] = rand() % 100; // Случайные числа от 0 до 99
+        arr[i] = rand() % 100;
     }
 }
 
-// Последовательная сумма элементов массива
-long long sequential_sum(int *arr, int size) {
+long long sequential_sum(int* arr, int size) {
     long long sum = 0;
     for (int i = 0; i < size; i++) {
         sum += arr[i];
@@ -24,91 +20,93 @@ long long sequential_sum(int *arr, int size) {
     return sum;
 }
 
-// Параллельная сумма элементов массива
-long long parallel_sum(int *arr, int size, int num_threads) {
-    long long sum = 0;
-    omp_set_num_threads(num_threads);
-#pragma omp parallel for reduction(+:sum)
-    for (int i = 0; i < size; i++) {
-        sum += arr[i];
-    }
-    return sum;
-}
+int main(int argc, char* argv[]) {
+    int rank, num_procs, array_size, local_size;
+    int* arr = NULL, * local_arr = NULL;
+    long long total_sum = 0, local_sum = 0, sequential_result = 0;
+    double total_seq_time = 0.0, total_par_time = 0.0;
+    unsigned int seed = 0;
 
-int main() {
-    int size, num_threads;
-    int *arr;
-    clock_t start_time, end_time;
-    double sequential_time, parallel_time;
-    long long sequential_result, parallel_result;
-    double total_sequential_time, total_parallel_time;
+    // Initialize MPI
+    MPI_Init(&argc, &argv);
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &num_procs);
 
-    // Чтение размера массива из переменной окружения SIZE
-    char *size_str = getenv("SIZE");
-    if (size_str == NULL) {
-        fprintf(stderr, "Ошибка: не задана переменная окружения SIZE\n");
-        return 1;
-    }
-    size = atoi(size_str);
+    // Get parameters
+    char* array_size_str = getenv("ARRAY_SIZE");
+    array_size = array_size_str ? atoi(array_size_str) : 100000000;
+    seed = (unsigned int)time(NULL) + rank;  // Different seed for each process
 
-    // Проверка размера массива
-    if (size < MIN_SIZE || size > MAX_SIZE) {
-        fprintf(stderr, "Ошибка: размер массива должен быть между %d и %d\n", MIN_SIZE, MAX_SIZE);
-        return 1;
+    // Validate parameters
+    if (array_size <= 0) array_size = 100000000;
+    if (array_size < num_procs && rank == 0) {
+        fprintf(stderr, "Warning: Array size is smaller than number of processes\n");
     }
 
-    // Выделяем память под массив
-    arr = (int *)malloc(size * sizeof(int));
-    if (arr == NULL) {
-        fprintf(stderr, "Ошибка выделения памяти.\n");
-        return 1;
+    local_size = (array_size + num_procs - 1) / num_procs;
+
+    // Allocate memory once
+    if (rank == 0) {
+        arr = (int*)malloc(array_size * sizeof(int));
+    }
+    local_arr = (int*)malloc(local_size * sizeof(int));
+
+    // Warm-up run (to avoid cold start effects)
+    if (rank == 0) {
+        fill_array_random(arr, array_size, seed);
+        sequential_sum(arr, array_size);
+    }
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    // Main measurement loop
+    for (int iter = 0; iter < ITERATIONS; iter++) {
+        if (rank == 0) {
+            // Prepare new random data
+            fill_array_random(arr, array_size, seed + iter);
+
+            // Measure sequential time
+            double seq_start = MPI_Wtime();
+            sequential_result = sequential_sum(arr, array_size);
+            double seq_end = MPI_Wtime();
+            total_seq_time += (seq_end - seq_start);
+        }
+
+        // Synchronize before parallel section
+        MPI_Barrier(MPI_COMM_WORLD);
+        double par_start = MPI_Wtime();
+
+        // Parallel computation
+        MPI_Scatter(arr, local_size, MPI_INT, local_arr, local_size, MPI_INT, 0, MPI_COMM_WORLD);
+
+        local_sum = 0;
+        for (int i = 0; i < local_size; i++) {
+            local_sum += local_arr[i];
+        }
+
+        MPI_Reduce(&local_sum, &total_sum, 1, MPI_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
+        double par_end = MPI_Wtime();
+
+        if (rank == 0) {
+            total_par_time += (par_end - par_start);
+        }
     }
 
-    // Заполняем массив случайными числами
-    fill_array_random(arr, size);
+    // Print results
+    if (rank == 0) {
+        double avg_seq_time = total_seq_time / ITERATIONS;
+        double avg_par_time = total_par_time / ITERATIONS;
 
-    // --- Последовательный вариант ---
-    printf("--- Последовательный вариант ---\n");
-    total_sequential_time = 0.0;
-    for (int i = 0; i < NUM_ITERATIONS; i++) {
-        start_time = clock();
-        sequential_result = sequential_sum(arr, size);
-        end_time = clock();
-        sequential_time = (double)(end_time - start_time) / CLOCKS_PER_SEC;
-        total_sequential_time += sequential_time;
+        printf("Array size: %d\n", array_size);
+        printf("Number of processes: %d\n", num_procs);
+        printf("\nAverage execution time:\n");
+        printf("  Sequential sum: %.6f sec\n", avg_seq_time);
+        printf("  Parallel sum:   %.6f sec\n", avg_par_time);
+        printf("  Speedup:       %.2fx\n", avg_seq_time / avg_par_time);
+
+        free(arr);
     }
-    printf("Среднее время последовательной суммы: %f секунд\n", total_sequential_time / NUM_ITERATIONS);
-    printf("Сумма: %lld\n", sequential_result);
 
-    // --- Параллельный вариант ---
-    printf("--- Параллельный вариант ---\n");
-
-    // Чтение количества потоков из переменной окружения NUM_THREADS
-    char *num_threads_str = getenv("NUM_THREADS");
-    if (num_threads_str == NULL) {
-        fprintf(stderr, "Ошибка: не задана переменная окружения NUM_THREADS\n");
-        return 1;
-    }
-    num_threads = atoi(num_threads_str);
-
-    // Проверка количества потоков
-    if (num_threads <= 0) {
-        fprintf(stderr, "Ошибка: количество потоков должно быть положительным.\n");
-        return 1;
-    }
-    total_parallel_time = 0.0;
-    for (int i = 0; i < NUM_ITERATIONS; i++) {
-        start_time = clock();
-        parallel_result = parallel_sum(arr, size, num_threads);
-        end_time = clock();
-        parallel_time = (double)(end_time - start_time) / CLOCKS_PER_SEC;
-        total_parallel_time += parallel_time;
-    }
-    printf("Среднее время параллельной суммы (с %d потоками): %f секунд\n", num_threads, total_parallel_time / NUM_ITERATIONS);
-    printf("Сумма: %lld\n", parallel_result);
-
-    // Освобождаем память
-    free(arr);
-
+    free(local_arr);
+    MPI_Finalize();
     return 0;
 }
